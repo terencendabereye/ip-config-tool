@@ -44,7 +44,10 @@ pub struct App {
     identify_inflight: RefCell<Option<String>>,
     identify_cache: RefCell<HashMap<String, IdentifyResult>>,
 
-    #[nwg_control(size: (1000, 780), position: (200, 100), title: "IP Config Tool", flags: "WINDOW|VISIBLE|RESIZABLE")]
+    #[nwg_resource(source_bin: Some(include_bytes!("../assets/app.ico")))]
+    app_icon: nwg::Icon,
+
+    #[nwg_control(size: (1000, 780), position: (200, 100), title: "IP Config Tool", icon: Some(&data.app_icon), flags: "WINDOW|VISIBLE|RESIZABLE")]
     #[nwg_events( OnWindowClose: [App::on_close], OnInit: [App::on_init] )]
     window: nwg::Window,
 

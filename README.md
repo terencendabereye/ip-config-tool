@@ -135,3 +135,23 @@ and sorted, embedded into the binary at compile time (`src/oui.rs`) so
 vendor lookup works fully offline. To refresh it against IEEE's current
 registry: download `oui.csv` from that URL into `data/oui_raw.csv`, then run
 `python data/trim_oui.py` from the `data/` directory.
+
+## Icon
+
+`assets/app.ico` (an RJ45 port silhouette, viewed head-on) is embedded as
+both the exe's file icon (`build.rs`, via the `winres` crate) and the
+running window's icon (`src/gui.rs`, via `nwg::Icon::from_bin`). Regenerate
+it with `python assets/build_icon.py` after editing the glyph in
+`assets/build_icon.py` itself (the source of truth — there's no separate
+vector file to keep in sync).
+
+## A note on `lto` in `Cargo.toml`
+
+`profile.release` deliberately sets `lto = false`. Fat LTO was tried for
+extra size reduction and found to silently strip reachable application code
+in a clean build — confirmed by grepping the compiled exe for literal
+strings from `App::build_ui` and everything downstream of it (all present
+with LTO off, all missing with it on). If re-enabling LTO in the future,
+verify with the same check (`python -c "print(b'IP Config Tool' in open('target/release/ip-config-tool.exe','rb').read())"`
+after a **clean** `cargo build --release` — a stale `target/` can mask this)
+before trusting the build.

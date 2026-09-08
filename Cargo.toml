@@ -27,10 +27,16 @@ features = ["combobox", "list-view", "timer", "notice", "clipboard"]
 
 [build-dependencies]
 embed-manifest = "1.5.0"
+winres = "0.1.12"
 
 [profile.release]
 opt-level = "z"
-lto = true
+# Fat LTO (lto = true) was found to silently over-eliminate reachable code
+# in a clean build with this dependency set (native-windows-derive's
+# generated App::build_ui and everything it calls disappeared entirely —
+# confirmed via string search on the compiled exe, not just a hunch).
+# Keep this off; a ~1.7MB exe is still trivially "small" without it.
+lto = false
 strip = true
 panic = "abort"
 
