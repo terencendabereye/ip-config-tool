@@ -48,19 +48,39 @@ browser), **Wake-on-LAN**, and **Copy IP** / **Copy MAC**.
 
 ## Requirements
 
+To **run** the built exe: Windows 10/11 and administrator rights (the exe
+requests elevation — a UAC prompt on launch — since changing adapter IP
+settings requires it). Nothing else; see "Building" below for why.
+
+To **build from source**:
 - Windows 10/11.
-- Administrator rights — the exe requests elevation (UAC prompt) on launch,
-  since changing adapter IP settings requires it.
+- The Rust toolchain, MSVC edition (`x86_64-pc-windows-msvc`) — install via
+  [rustup.rs](https://rustup.rs). This is the default target rustup picks on
+  Windows, so a plain `rustup-init.exe` run is normally enough.
+- The MSVC linker, from either **Visual Studio** (Desktop development with
+  C++ workload) or the smaller **[Build Tools for Visual
+  Studio](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022)**
+  (just the "Desktop development with C++" component, no full IDE needed).
+  This is a Windows/MSVC-toolchain requirement, not specific to this
+  project — `rustup` will tell you if it's missing when you try to build.
+- No other dependencies. `data/oui.csv` (the embedded offline vendor
+  database, ~1.2MB) is checked into the repo, so a plain `git clone` +
+  `cargo build` needs no separate download/generation step — verified by
+  building from a fresh clone in an empty directory.
 
 ## Building
 
 ```
+git clone https://github.com/terencendabereye/ip-config-tool.git
+cd ip-config-tool
 cargo build --release
 ```
 
 The result is a single, self-contained `target\release\ip-config-tool.exe`
-(no runtime to install — Rust compiles to a native binary). Copy that one
-file anywhere to run it on another PC.
+(no runtime to install — Rust compiles to a native binary; all dependencies
+in `Cargo.toml`/`Cargo.lock` are pulled from crates.io automatically by
+`cargo build`, no manual dependency installation). Copy that one file
+anywhere to run it on another PC.
 
 For machines where even the standard VC++ runtime/UCRT (present on
 essentially all Windows 10/11 installs) shouldn't be assumed, build with the
