@@ -46,6 +46,31 @@ browser), **Wake-on-LAN**, and **Copy IP** / **Copy MAC**.
 > issue on the repo for the planned follow-up (a proper ConPTY-backed
 > terminal, needed for full interactive fidelity in SSH sessions).
 
+## When IPv4 is a dead end: IPv6 link-local
+
+Every "Scan for devices" click also reads the IPv6 neighbor table
+(`netsh interface ipv6 show neighbors`) for the selected adapter, alongside
+the ARP sweep. This matters because **IPv6 link-local addresses
+(`fe80::/10`) self-assign on any live Ethernet link with zero configuration
+on either end** — no DHCP, no subnet match, nothing that a misconfigured or
+recently-changed IPv4 network can break. It's the fallback that works when
+a site's switch/routing config has been changed without your knowledge and
+IPv4 auto-detect has nothing to try.
+
+Any link-local neighbor found shows up as another row (its zoned address,
+e.g. `fe80::...%12`), and works with the same identify/action flow as an
+IPv4 row — vendor lookup, port scan, Ping/Traceroute/SSH, Open web UI, Copy.
+(Reverse DNS and NetBIOS name lookup are skipped for these, since neither
+applies to a link-local address.) If the adapter has no DHCP gateway at
+all, the scan-complete status also flags that it may be a direct cable
+connection — most common workflow here: Ethernet straight from your laptop
+into a PLC, no switch in between.
+
+Most PLCs/RTUs are IPv4-only, so don't expect this to find the device
+itself in the common case — its proven value is reaching *something* (a
+managed switch's management interface, another PC) when IPv4 has otherwise
+completely failed.
+
 ## Requirements
 
 To **run** the built exe: Windows 10/11 and administrator rights (the exe
@@ -94,10 +119,10 @@ cargo build --release
 ## Testing
 
 `cargo test` runs the full unit test suite (parsing of real captured
-`netsh`/`arp`/`nbtstat` output, IP/mask/gateway validation, backup/restore
-JSON round-trips, the auto-detect decision logic, OUI vendor lookups, and
-Wake-on-LAN packet construction) — **no admin rights and no network changes
-required**, safe to run anytime.
+`netsh`/`arp`/`nbtstat`/IPv6-neighbor-table output, IP/mask/gateway
+validation, backup/restore JSON round-trips, the auto-detect decision
+logic, OUI vendor lookups, and Wake-on-LAN packet construction) — **no
+admin rights and no network changes required**, safe to run anytime.
 
 Test binaries deliberately do **not** get the `requireAdministrator`
 manifest (only the `[[bin]]` GUI target does — see `build.rs` and the
@@ -139,9 +164,13 @@ registry: download `oui.csv` from that URL into `data/oui_raw.csv`, then run
 ## Icon
 
 `assets/app.ico` (an RJ45 port silhouette, viewed head-on) is embedded as
-both the exe's file icon (`build.rs`, via the `winres` crate) and the
-running window's icon (`src/gui.rs`, via `nwg::Icon::from_bin`). Regenerate
-it with `python assets/build_icon.py` after editing the glyph in
+the exe's file icon (`build.rs`, via the `winres` crate). The running
+window's icon (`src/gui.rs`) is read back out of that same compiled-in
+resource via `nwg::EmbedResource` rather than decoded from raw bytes at
+runtime — `Icon::from_bin` needs nwg's `"image-decoder"` feature, which
+isn't enabled, and panics instantly (with no visible error, since this is a
+console-less app) without it. Regenerate the `.ico` with
+`python assets/build_icon.py` after editing the glyph in
 `assets/build_icon.py` itself (the source of truth — there's no separate
 vector file to keep in sync).
 

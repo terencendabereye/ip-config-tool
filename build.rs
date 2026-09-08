@@ -9,8 +9,10 @@ fn main() {
         .expect("unable to embed application manifest (requireAdministrator)");
 
         // Exe file icon (shown in Explorer/taskbar for the file itself).
-        // The running window's icon is set separately at runtime in gui.rs
-        // via Icon::from_bin on the same file, since nwg needs it explicit.
+        // The running window's icon is set separately at runtime in gui.rs,
+        // read back out of this same compiled-in resource via EmbedResource
+        // (Icon::from_bin would need nwg's "image-decoder" feature, which
+        // isn't enabled, and panics silently without it).
         winres::WindowsResource::new()
             .set_icon("assets/app.ico")
             .compile()

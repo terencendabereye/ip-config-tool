@@ -3,6 +3,7 @@
 
 use crate::autodetect::{self, AutoDetectEvent};
 use crate::identify::{self, IdentifyResult};
+use crate::ipv6::{self, Ipv6Neighbor};
 use crate::netconfig;
 use crate::netiface::{self, InterfaceConfig};
 use crate::scanner::{self, ScanResult};
@@ -34,6 +35,19 @@ pub struct App {
     scan_cancel: RefCell<Option<Arc<Mutex<bool>>>>,
     scan_running: Arc<AtomicBool>,
     scan_seen: RefCell<HashSet<String>>,
+
+    // IPv6 link-local neighbor discovery runs alongside the ARP sweep on
+    // every "Scan for devices" click (folded in rather than a separate
+    // button, so you don't have to remember to try it when IPv4 is the
+    // thing that's broken). Its own thread/channel/running-flag, same
+    // established pattern as the ARP scan above.
+    ipv6_rx: RefCell<Option<Receiver<Ipv6Neighbor>>>,
+    ipv6_running: Arc<AtomicBool>,
+    // True while a scan is in flight and its "N host(s) found" completion
+    // message hasn't been reported yet — both the ARP and IPv6 sides clear
+    // their own rx independently, but the combined completion status (and
+    // the direct-connection hint) should only fire once, after both finish.
+    scan_completion_pending: Cell<bool>,
 
     autodetect_rx: RefCell<Option<Receiver<AutoDetectEvent>>>,
     autodetect_cancel: RefCell<Option<Arc<Mutex<bool>>>>,
@@ -444,6 +458,7 @@ impl App {
 
         self.results_list.clear();
         self.scan_seen.borrow_mut().clear();
+        self.scan_completion_pending.set(true);
 
         let cancelled = Arc::new(Mutex::new(false));
         *self.scan_cancel.borrow_mut() = Some(Arc::clone(&cancelled));
@@ -457,8 +472,32 @@ impl App {
             running.store(false, Ordering::SeqCst);
         });
 
+        self.start_ipv6_discovery();
+
         self.scan_button.set_enabled(false);
-        self.set_status("Scanning (ARP)...");
+        self.set_status("Scanning (ARP + IPv6 neighbors)...");
+    }
+
+    /// Looks up the selected interface's numeric index (needed to scope
+    /// link-local pings/sockets) and spawns the IPv6 neighbor-table read on
+    /// its own background thread. Best-effort: if the interface can't be
+    /// found for some reason, the ARP scan still proceeds without it.
+    fn start_ipv6_discovery(&self) {
+        let Some(iface_name) = self.current_iface() else { return };
+        let Ok(interfaces) = netiface::list_interfaces() else { return };
+        let Some(iface_idx) = interfaces.iter().find(|i| i.name == iface_name).map(|i| i.idx) else { return };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        *self.ipv6_rx.borrow_mut() = Some(rx);
+        self.ipv6_running.store(true, Ordering::SeqCst);
+
+        let running = Arc::clone(&self.ipv6_running);
+        thread::spawn(move || {
+            for neighbor in ipv6::discover_neighbors(iface_idx, &iface_name) {
+                let _ = tx.send(neighbor);
+            }
+            running.store(false, Ordering::SeqCst);
+        });
     }
 
     fn on_cancel(&self) {
@@ -473,6 +512,7 @@ impl App {
     fn on_tick(&self) {
         self.drain_autodetect_events();
         self.drain_scan_results();
+        self.drain_ipv6_results();
         self.drain_identify_results();
         self.tick_revert_countdown();
     }
@@ -537,9 +577,60 @@ impl App {
 
         if !self.scan_running.load(Ordering::SeqCst) && self.scan_rx.borrow().is_some() {
             *self.scan_rx.borrow_mut() = None;
-            self.scan_button.set_enabled(true);
-            self.set_status(&format!("Scan complete: {} host(s) found.", self.results_list.len()));
+            self.try_report_scan_complete();
         }
+    }
+
+    fn drain_ipv6_results(&self) {
+        let mut neighbors = Vec::new();
+        if let Some(rx) = self.ipv6_rx.borrow().as_ref() {
+            neighbors.extend(rx.try_iter());
+        }
+        for n in neighbors {
+            let mut seen = self.scan_seen.borrow_mut();
+            if !seen.insert(n.address_with_zone.clone()) {
+                continue;
+            }
+            drop(seen);
+            self.results_list.insert_items_row(
+                None,
+                &[n.address_with_zone.as_str(), n.mac.as_deref().unwrap_or(""), "", "", ""],
+            );
+        }
+
+        if !self.ipv6_running.load(Ordering::SeqCst) && self.ipv6_rx.borrow().is_some() {
+            *self.ipv6_rx.borrow_mut() = None;
+            self.try_report_scan_complete();
+        }
+    }
+
+    /// Reports the combined "N host(s) found" status (and the direct-cable
+    /// hint) exactly once, after both the ARP sweep and the IPv6 neighbor
+    /// read have finished — whichever of the two finishes second is the one
+    /// that ends up calling this with everything actually settled.
+    fn try_report_scan_complete(&self) {
+        if !self.scan_completion_pending.get() {
+            return;
+        }
+        if self.scan_running.load(Ordering::SeqCst) || self.ipv6_running.load(Ordering::SeqCst) {
+            return;
+        }
+        if self.scan_rx.borrow().is_some() || self.ipv6_rx.borrow().is_some() {
+            return;
+        }
+
+        self.scan_completion_pending.set(false);
+        self.scan_button.set_enabled(true);
+
+        let mut message = format!("Scan complete: {} host(s) found.", self.results_list.len());
+        if let Some(iface) = self.current_iface() {
+            if let Ok(cfg) = netiface::get_interface_config(&iface) {
+                if cfg.gateway.is_none() {
+                    message.push_str(" No gateway detected — this may be a direct cable connection.");
+                }
+            }
+        }
+        self.set_status(&message);
     }
 
     /// Reads the IP/MAC out of the currently selected results row, if any.
@@ -576,7 +667,10 @@ impl App {
         }
 
         let Some(mac_text) = self.results_list.item(row, 1, 64).map(|i| i.text) else { return };
-        let Some(mac) = tools::parse_mac(&mac_text) else { return };
+        // A blank/unresolved MAC (e.g. an IPv6 neighbor whose link layer
+        // address never resolved) still gets identified — vendor lookup is
+        // just skipped for it, not the whole thing.
+        let mac = tools::parse_mac(&mac_text);
 
         self.results_list.update_item(row, nwg::InsertListViewItem {
             column_index: 4,
@@ -677,7 +771,8 @@ impl App {
             .get(&ip)
             .map(|r| if r.open_ports.contains(&"HTTPS") && !r.open_ports.contains(&"HTTP") { "https" } else { "http" })
             .unwrap_or("http");
-        if let Err(e) = tools::open_browser(&format!("{scheme}://{ip}")) {
+        let host = if ip.contains(':') { ipv6::ipv6_url_host(&ip) } else { ip };
+        if let Err(e) = tools::open_browser(&format!("{scheme}://{host}")) {
             nwg::modal_error_message(&self.window, "Could not open browser", &e);
         }
     }

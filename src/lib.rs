@@ -7,6 +7,7 @@
 pub mod autodetect;
 pub mod gui;
 pub mod identify;
+pub mod ipv6;
 pub mod netconfig;
 pub mod netiface;
 pub mod oui;
