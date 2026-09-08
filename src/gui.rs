@@ -2,9 +2,11 @@
 // OnTimerTick still fires on the UI thread, which is exactly what this app needs.
 
 use crate::autodetect::{self, AutoDetectEvent};
+use crate::identify::{self, IdentifyResult};
 use crate::netconfig;
 use crate::netiface::{self, InterfaceConfig};
 use crate::scanner::{self, ScanResult};
+use crate::tools;
 use crate::validate;
 
 use native_windows_derive::NwgUi;
@@ -12,7 +14,7 @@ use native_windows_gui as nwg;
 use nwg::NativeUi;
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
@@ -37,7 +39,12 @@ pub struct App {
     autodetect_cancel: RefCell<Option<Arc<Mutex<bool>>>>,
     autodetect_running: Arc<AtomicBool>,
 
-    #[nwg_control(size: (920, 660), position: (250, 150), title: "IP Config Tool", flags: "WINDOW|VISIBLE|RESIZABLE")]
+    identify_rx: RefCell<Option<Receiver<(String, IdentifyResult)>>>,
+    identify_running: Arc<AtomicBool>,
+    identify_inflight: RefCell<Option<String>>,
+    identify_cache: RefCell<HashMap<String, IdentifyResult>>,
+
+    #[nwg_control(size: (1000, 780), position: (200, 100), title: "IP Config Tool", flags: "WINDOW|VISIBLE|RESIZABLE")]
     #[nwg_events( OnWindowClose: [App::on_close], OnInit: [App::on_init] )]
     window: nwg::Window,
 
@@ -45,7 +52,7 @@ pub struct App {
     #[nwg_events( OnTimerTick: [App::on_tick] )]
     timer: nwg::Timer,
 
-    #[nwg_layout(parent: window, spacing: 8, margin: [10,10,10,10], min_size: [880, 600])]
+    #[nwg_layout(parent: window, spacing: 8, margin: [10,10,10,10], min_size: [950, 720])]
     grid: nwg::GridLayout,
 
     #[nwg_control(text: "Adapter:")]
@@ -115,20 +122,60 @@ pub struct App {
     status_label: nwg::Label,
 
     #[nwg_control(list_style: nwg::ListViewStyle::Detailed, ex_flags: nwg::ListViewExFlags::GRID | nwg::ListViewExFlags::FULL_ROW_SELECT)]
-    #[nwg_layout_item(layout: grid, row: 5, col: 0, col_span: 5, row_span: 6)]
+    #[nwg_layout_item(layout: grid, row: 5, col: 0, col_span: 5, row_span: 5)]
+    #[nwg_events( OnListViewClick: [App::on_list_select(SELF, EVT_DATA)] )]
     results_list: nwg::ListView,
 
+    #[nwg_control(text: "Ping")]
+    #[nwg_layout_item(layout: grid, row: 10, col: 0)]
+    #[nwg_events( OnButtonClick: [App::on_ping] )]
+    ping_button: nwg::Button,
+
+    #[nwg_control(text: "Traceroute")]
+    #[nwg_layout_item(layout: grid, row: 10, col: 1)]
+    #[nwg_events( OnButtonClick: [App::on_traceroute] )]
+    traceroute_button: nwg::Button,
+
+    #[nwg_control(text: "SSH")]
+    #[nwg_layout_item(layout: grid, row: 10, col: 2)]
+    #[nwg_events( OnButtonClick: [App::on_ssh] )]
+    ssh_button: nwg::Button,
+
+    #[nwg_control(text: "Open web UI")]
+    #[nwg_layout_item(layout: grid, row: 10, col: 3)]
+    #[nwg_events( OnButtonClick: [App::on_open_browser] )]
+    open_browser_button: nwg::Button,
+
+    #[nwg_control(text: "Wake-on-LAN")]
+    #[nwg_layout_item(layout: grid, row: 10, col: 4)]
+    #[nwg_events( OnButtonClick: [App::on_wake_on_lan] )]
+    wol_button: nwg::Button,
+
+    #[nwg_control(text: "Copy IP")]
+    #[nwg_layout_item(layout: grid, row: 11, col: 0)]
+    #[nwg_events( OnButtonClick: [App::on_copy_ip] )]
+    copy_ip_button: nwg::Button,
+
+    #[nwg_control(text: "Copy MAC")]
+    #[nwg_layout_item(layout: grid, row: 11, col: 1)]
+    #[nwg_events( OnButtonClick: [App::on_copy_mac] )]
+    copy_mac_button: nwg::Button,
+
+    #[nwg_control(text: "Select a device above to enable these actions.")]
+    #[nwg_layout_item(layout: grid, row: 11, col: 2, col_span: 3)]
+    actions_hint_label: nwg::Label,
+
     #[nwg_control(text: "")]
-    #[nwg_layout_item(layout: grid, row: 11, col: 0, col_span: 5)]
+    #[nwg_layout_item(layout: grid, row: 12, col: 0, col_span: 5)]
     countdown_label: nwg::Label,
 
     #[nwg_control(text: "Keep these settings")]
-    #[nwg_layout_item(layout: grid, row: 12, col: 0, col_span: 2)]
+    #[nwg_layout_item(layout: grid, row: 13, col: 0, col_span: 2)]
     #[nwg_events( OnButtonClick: [App::on_keep] )]
     keep_button: nwg::Button,
 
     #[nwg_control(text: "Revert to original settings")]
-    #[nwg_layout_item(layout: grid, row: 12, col: 2, col_span: 3)]
+    #[nwg_layout_item(layout: grid, row: 13, col: 2, col_span: 3)]
     #[nwg_events( OnButtonClick: [App::on_revert_clicked] )]
     revert_button: nwg::Button,
 }
@@ -138,19 +185,48 @@ impl App {
         self.results_list.insert_column("IP address");
         self.results_list.insert_column(nwg::InsertListViewColumn {
             index: Some(1),
-            width: Some(180),
+            width: Some(150),
             text: Some("MAC address".into()),
+            ..Default::default()
+        });
+        self.results_list.insert_column(nwg::InsertListViewColumn {
+            index: Some(2),
+            width: Some(160),
+            text: Some("Vendor".into()),
+            ..Default::default()
+        });
+        self.results_list.insert_column(nwg::InsertListViewColumn {
+            index: Some(3),
+            width: Some(160),
+            text: Some("Hostname".into()),
+            ..Default::default()
+        });
+        self.results_list.insert_column(nwg::InsertListViewColumn {
+            index: Some(4),
+            width: Some(220),
+            text: Some("Open ports (select a row to resolve)".into()),
             ..Default::default()
         });
         self.results_list.set_headers_enabled(true);
 
         self.revert_button.set_enabled(false);
         self.keep_button.set_enabled(false);
+        self.set_device_actions_enabled(false);
 
         self.refresh_interfaces();
         self.revert_all_backups_silently("Reverted leftover settings from a previous session");
 
         self.timer.start();
+    }
+
+    fn set_device_actions_enabled(&self, enabled: bool) {
+        self.ping_button.set_enabled(enabled);
+        self.traceroute_button.set_enabled(enabled);
+        self.ssh_button.set_enabled(enabled);
+        self.open_browser_button.set_enabled(enabled);
+        self.wol_button.set_enabled(enabled);
+        self.copy_ip_button.set_enabled(enabled);
+        self.copy_mac_button.set_enabled(enabled);
     }
 
     fn refresh_interfaces(&self) {
@@ -387,6 +463,7 @@ impl App {
     fn on_tick(&self) {
         self.drain_autodetect_events();
         self.drain_scan_results();
+        self.drain_identify_results();
         self.tick_revert_countdown();
     }
 
@@ -445,13 +522,181 @@ impl App {
                 continue;
             }
             drop(seen);
-            self.results_list.insert_items_row(None, &[r.ip.as_str(), r.mac.as_str()]);
+            self.results_list.insert_items_row(None, &[r.ip.as_str(), r.mac.as_str(), "", "", ""]);
         }
 
         if !self.scan_running.load(Ordering::SeqCst) && self.scan_rx.borrow().is_some() {
             *self.scan_rx.borrow_mut() = None;
             self.scan_button.set_enabled(true);
             self.set_status(&format!("Scan complete: {} host(s) found.", self.results_list.len()));
+        }
+    }
+
+    /// Reads the IP/MAC out of the currently selected results row, if any.
+    fn selected_row_ip_mac(&self) -> Option<(String, String)> {
+        let row = self.results_list.selected_item()?;
+        let ip = self.results_list.item(row, 0, 64)?.text;
+        let mac = self.results_list.item(row, 1, 64)?.text;
+        Some((ip, mac))
+    }
+
+    /// Selecting a row identifies that one device on a background thread
+    /// (vendor via the offline OUI table, hostname via reverse DNS/NetBIOS,
+    /// a quick port scan) — never automatically for the whole scan, which
+    /// would slow the bulk sweep down for no benefit. Cached per-IP so
+    /// re-selecting an already-identified row doesn't redo the work.
+    fn on_list_select(&self, data: &nwg::EventData) {
+        let nwg::EventData::OnListViewItemIndex { row_index, .. } = data else { return };
+        if !self.results_list.selected_items().contains(row_index) {
+            return; // click landed on a row that isn't actually selected (e.g. deselect)
+        }
+
+        let row = *row_index;
+        let Some(item) = self.results_list.item(row, 0, 64) else { return };
+        let ip = item.text;
+        self.set_device_actions_enabled(true);
+
+        if let Some(cached) = self.identify_cache.borrow().get(&ip).cloned() {
+            self.write_identify_result(row, &cached);
+            return;
+        }
+
+        if self.identify_inflight.borrow().as_deref() == Some(ip.as_str()) {
+            return; // already resolving this one
+        }
+
+        let Some(mac_text) = self.results_list.item(row, 1, 64).map(|i| i.text) else { return };
+        let Some(mac) = tools::parse_mac(&mac_text) else { return };
+
+        self.results_list.update_item(row, nwg::InsertListViewItem {
+            column_index: 4,
+            text: Some("Resolving…".to_string()),
+            ..Default::default()
+        });
+
+        *self.identify_inflight.borrow_mut() = Some(ip.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        *self.identify_rx.borrow_mut() = Some(rx);
+        self.identify_running.store(true, Ordering::SeqCst);
+
+        let running = Arc::clone(&self.identify_running);
+        let ip_owned = ip.clone();
+        thread::spawn(move || {
+            let result = identify::identify(&ip_owned, mac);
+            let _ = tx.send((ip_owned, result));
+            running.store(false, Ordering::SeqCst);
+        });
+    }
+
+    fn drain_identify_results(&self) {
+        let mut results = Vec::new();
+        if let Some(rx) = self.identify_rx.borrow().as_ref() {
+            results.extend(rx.try_iter());
+        }
+        for (ip, result) in results {
+            self.identify_cache.borrow_mut().insert(ip.clone(), result.clone());
+            if self.identify_inflight.borrow().as_deref() == Some(ip.as_str()) {
+                *self.identify_inflight.borrow_mut() = None;
+            }
+            if let Some(row) = self.find_row_by_ip(&ip) {
+                self.write_identify_result(row, &result);
+            }
+        }
+
+        if !self.identify_running.load(Ordering::SeqCst) && self.identify_rx.borrow().is_some() {
+            *self.identify_rx.borrow_mut() = None;
+        }
+    }
+
+    fn find_row_by_ip(&self, ip: &str) -> Option<usize> {
+        (0..self.results_list.len()).find(|&row| self.results_list.item(row, 0, 64).map(|i| i.text.as_str() == ip).unwrap_or(false))
+    }
+
+    fn write_identify_result(&self, row: usize, result: &IdentifyResult) {
+        let vendor = result.vendor.as_deref().unwrap_or("(unknown)");
+        let hostname = result.hostname.as_deref().unwrap_or("(none)");
+        let ports = if result.open_ports.is_empty() { "(none open)".to_string() } else { result.open_ports.join(", ") };
+
+        self.results_list.update_item(row, nwg::InsertListViewItem {
+            column_index: 2,
+            text: Some(vendor.to_string()),
+            ..Default::default()
+        });
+        self.results_list.update_item(row, nwg::InsertListViewItem {
+            column_index: 3,
+            text: Some(hostname.to_string()),
+            ..Default::default()
+        });
+        self.results_list.update_item(row, nwg::InsertListViewItem {
+            column_index: 4,
+            text: Some(ports),
+            ..Default::default()
+        });
+    }
+
+    fn on_ping(&self) {
+        let Some((ip, _)) = self.selected_row_ip_mac() else { return };
+        if let Err(e) = tools::launch_visible("ping", &["-t", &ip]) {
+            nwg::modal_error_message(&self.window, "Could not start ping", &e);
+        }
+    }
+
+    fn on_traceroute(&self) {
+        let Some((ip, _)) = self.selected_row_ip_mac() else { return };
+        if let Err(e) = tools::launch_visible("tracert", &[&ip]) {
+            nwg::modal_error_message(&self.window, "Could not start traceroute", &e);
+        }
+    }
+
+    fn on_ssh(&self) {
+        let Some((ip, _)) = self.selected_row_ip_mac() else { return };
+        if let Err(e) = tools::launch_visible("ssh", &[&ip]) {
+            nwg::modal_error_message(
+                &self.window,
+                "Could not start SSH",
+                &format!("{e}\n\nWindows' OpenSSH client (ssh.exe) may not be installed — it's an optional Windows feature."),
+            );
+        }
+    }
+
+    fn on_open_browser(&self) {
+        let Some((ip, _)) = self.selected_row_ip_mac() else { return };
+        let scheme = self
+            .identify_cache
+            .borrow()
+            .get(&ip)
+            .map(|r| if r.open_ports.contains(&"HTTPS") && !r.open_ports.contains(&"HTTP") { "https" } else { "http" })
+            .unwrap_or("http");
+        if let Err(e) = tools::open_browser(&format!("{scheme}://{ip}")) {
+            nwg::modal_error_message(&self.window, "Could not open browser", &e);
+        }
+    }
+
+    fn on_wake_on_lan(&self) {
+        let Some((_, mac_text)) = self.selected_row_ip_mac() else { return };
+        let Some(mac) = tools::parse_mac(&mac_text) else {
+            nwg::modal_error_message(&self.window, "Invalid MAC address", &mac_text);
+            return;
+        };
+        match tools::wake_on_lan(mac) {
+            Ok(()) => self.set_status(&format!("Sent Wake-on-LAN packet to {mac_text}.")),
+            Err(e) => {
+                nwg::modal_error_message(&self.window, "Wake-on-LAN failed", &e);
+            }
+        }
+    }
+
+    fn on_copy_ip(&self) {
+        if let Some((ip, _)) = self.selected_row_ip_mac() {
+            nwg::Clipboard::set_data_text(&self.window, &ip);
+            self.set_status(&format!("Copied {ip} to clipboard."));
+        }
+    }
+
+    fn on_copy_mac(&self) {
+        if let Some((_, mac)) = self.selected_row_ip_mac() {
+            nwg::Clipboard::set_data_text(&self.window, &mac);
+            self.set_status(&format!("Copied {mac} to clipboard."));
         }
     }
 

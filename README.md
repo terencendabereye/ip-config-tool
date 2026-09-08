@@ -19,6 +19,33 @@ unknown IP address (PLCs, RTUs, energy meters, etc.):
    settings at all. Closing the app also reverts everything automatically,
    with no confirmation prompt needed.
 
+## Identifying and working with a discovered device
+
+Selecting a row in the scan results resolves (in the background, one device
+at a time — the bulk scan itself never slows down for this) its:
+
+- **Vendor**, from the MAC's OUI, looked up entirely offline against an
+  embedded copy of IEEE's public registry (~40,000 entries) — works even on
+  an isolated plant network with no internet access.
+- **Hostname**, via reverse DNS, falling back to a NetBIOS name query
+  (`nbtstat`) when there's no DNS server on the segment, which is common on
+  OT networks.
+- **Open ports**, a quick check of ports relevant to identifying the device
+  (FTP, SSH, Telnet, HTTP/S, SMB, RDP) and common industrial protocols
+  (Modbus TCP, S7comm, DNP3, EtherNet/IP).
+
+Once a row is selected, the action buttons below the list operate on it:
+**Ping** and **Traceroute** (continuous, in a visible console window —
+Ctrl+C to stop), **SSH** (opens `ssh.exe` in a console window — requires
+Windows' OpenSSH client, an optional Windows feature, to be installed),
+**Open web UI** (launches the device's `http(s)://` page in your default
+browser), **Wake-on-LAN**, and **Copy IP** / **Copy MAC**.
+
+> Ping/Traceroute/SSH intentionally open in a separate console window for
+> now rather than an in-app terminal pane — see the "embedded terminal"
+> issue on the repo for the planned follow-up (a proper ConPTY-backed
+> terminal, needed for full interactive fidelity in SSH sessions).
+
 ## Requirements
 
 - Windows 10/11.
@@ -47,9 +74,10 @@ cargo build --release
 ## Testing
 
 `cargo test` runs the full unit test suite (parsing of real captured
-`netsh`/`arp` output, IP/mask/gateway validation, backup/restore JSON
-round-trips, the auto-detect decision logic) — **no admin rights and no
-network changes required**, safe to run anytime.
+`netsh`/`arp`/`nbtstat` output, IP/mask/gateway validation, backup/restore
+JSON round-trips, the auto-detect decision logic, OUI vendor lookups, and
+Wake-on-LAN packet construction) — **no admin rights and no network changes
+required**, safe to run anytime.
 
 Test binaries deliberately do **not** get the `requireAdministrator`
 manifest (only the `[[bin]]` GUI target does — see `build.rs` and the
@@ -78,3 +106,12 @@ remote-access NIC, in case a bug leaves it unreachable.
   before any `netsh` call is made. A dialog only ever appears for a genuine
   error (invalid input, a failed `netsh` call) — routine confirmations were
   deliberately removed to avoid popup spam.
+
+## Data: the embedded vendor (OUI) table
+
+`data/oui.csv` is a trimmed copy of IEEE's public MA-L registry
+(https://standards-oui.ieee.org/oui/oui.csv), reduced to `prefix,vendor`
+and sorted, embedded into the binary at compile time (`src/oui.rs`) so
+vendor lookup works fully offline. To refresh it against IEEE's current
+registry: download `oui.csv` from that URL into `data/oui_raw.csv`, then run
+`python data/trim_oui.py` from the `data/` directory.

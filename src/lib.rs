@@ -6,8 +6,11 @@
 
 pub mod autodetect;
 pub mod gui;
+pub mod identify;
 pub mod netconfig;
 pub mod netiface;
+pub mod oui;
 pub mod scanner;
+pub mod tools;
 pub mod validate;
 mod winproc;
