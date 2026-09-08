@@ -1,11 +1,13 @@
 #![allow(deprecated)] // nwg::Timer is deprecated in favour of AnimationTimer, but its
 // OnTimerTick still fires on the UI thread, which is exactly what this app needs.
 
+use crate::ansi::{Color, ScreenBuffer};
 use crate::autodetect::{self, AutoDetectEvent};
 use crate::identify::{self, IdentifyResult};
 use crate::ipv6::{self, Ipv6Neighbor};
 use crate::netconfig;
 use crate::netiface::{self, InterfaceConfig};
+use crate::pty::PtySession;
 use crate::scanner::{self, ScanResult};
 use crate::tools;
 use crate::validate;
@@ -16,6 +18,7 @@ use nwg::NativeUi;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
@@ -24,6 +27,16 @@ use std::time::{Duration, Instant};
 
 const AUTO_REVERT_SECS: u64 = 180;
 const TICK_MS: u32 = 200;
+// Fixed pty grid size. A real terminal would resize this to match the pane's
+// actual pixel size as the window is dragged; nwg's TabsContainer only
+// propagates resize to its direct Tab children (not further into a Tab's own
+// content, see `TabsContainer::hook_tabs`), so wiring that up would need
+// extra per-tab resize plumbing. 80x24 matches the size most device CLIs
+// (and `ssh`/`ping`/`tracert` themselves) already assume, which is "enough
+// fidelity for guiding someone through a device's CLI over the phone" per
+// the issue's stated scope — not attempting full dynamic resize.
+const TERMINAL_COLS: u16 = 80;
+const TERMINAL_ROWS: u16 = 24;
 
 #[derive(Default, NwgUi)]
 pub struct App {
@@ -58,6 +71,12 @@ pub struct App {
     identify_inflight: RefCell<Option<String>>,
     identify_cache: RefCell<HashMap<String, IdentifyResult>>,
 
+    // Live Ping/Traceroute/SSH sessions, one per launched tab. Tabs and
+    // their RichTextBoxes are created dynamically (not derive-macro fields)
+    // since there's one per tool launch rather than a fixed set — see
+    // `spawn_terminal_tab`.
+    pty_sessions: RefCell<Vec<PtyTabSession>>,
+
     // Reads the icon back out of the exe's own compiled-in resources (put
     // there by `winres` in build.rs, at id "1") rather than decoding raw
     // bytes at runtime — the latter (`Icon::from_bin`) requires nwg's
@@ -68,7 +87,14 @@ pub struct App {
     #[nwg_resource(source_embed: Some(&data.embedded_resources), source_embed_id: 1)]
     app_icon: nwg::Icon,
 
-    #[nwg_control(size: (1000, 780), position: (200, 100), title: "IP Config Tool", icon: Some(&data.app_icon), flags: "WINDOW|VISIBLE|RESIZABLE")]
+    // The window's global font (set via `Font::set_global_family` in `run`)
+    // is what every other control picks up automatically; RichTextBox does
+    // not, so pty tabs need an explicit font or they render at a tiny
+    // default size — see `spawn_terminal_tab`.
+    #[nwg_resource(family: "Consolas", size: 18)]
+    terminal_font: nwg::Font,
+
+    #[nwg_control(size: (1000, 1180), position: (200, 100), title: "IP Config Tool", icon: Some(&data.app_icon), flags: "WINDOW|VISIBLE|RESIZABLE")]
     #[nwg_events( OnWindowClose: [App::on_close], OnInit: [App::on_init] )]
     window: nwg::Window,
 
@@ -76,7 +102,7 @@ pub struct App {
     #[nwg_events( OnTimerTick: [App::on_tick] )]
     timer: nwg::Timer,
 
-    #[nwg_layout(parent: window, spacing: 8, margin: [10,10,10,10], min_size: [950, 720])]
+    #[nwg_layout(parent: window, spacing: 8, margin: [10,10,10,10], min_size: [950, 1120])]
     grid: nwg::GridLayout,
 
     #[nwg_control(text: "Adapter:")]
@@ -202,6 +228,29 @@ pub struct App {
     #[nwg_layout_item(layout: grid, row: 13, col: 2, col_span: 3)]
     #[nwg_events( OnButtonClick: [App::on_revert_clicked] )]
     revert_button: nwg::Button,
+
+    #[nwg_control(text: "Ping / Traceroute / SSH sessions appear here as tabs once launched.")]
+    #[nwg_layout_item(layout: grid, row: 14, col: 0, col_span: 5)]
+    terminal_hint_label: nwg::Label,
+
+    #[nwg_control]
+    #[nwg_layout_item(layout: grid, row: 15, col: 0, col_span: 5, row_span: 8)]
+    terminal_tabs: nwg::TabsContainer,
+}
+
+/// One launched Ping/Traceroute/SSH tab: the tab/output controls, the live
+/// ConPTY session, and the virtual screen buffer being rendered into the
+/// output box. `session` is `Rc`-shared with the key-forwarding closure
+/// bound in `spawn_terminal_tab` (see its comment for why).
+struct PtyTabSession {
+    title: String,
+    tab: nwg::Tab,
+    output: nwg::RichTextBox,
+    _layout: nwg::GridLayout,
+    session: Rc<PtySession>,
+    screen: ScreenBuffer,
+    ended: Cell<bool>,
+    _key_handler: nwg::EventHandler,
 }
 
 impl App {
@@ -514,6 +563,7 @@ impl App {
         self.drain_scan_results();
         self.drain_ipv6_results();
         self.drain_identify_results();
+        self.drain_pty_sessions();
         self.tick_revert_countdown();
     }
 
@@ -740,26 +790,138 @@ impl App {
 
     fn on_ping(&self) {
         let Some((ip, _)) = self.selected_row_ip_mac() else { return };
-        if let Err(e) = tools::launch_visible("ping", &["-t", &ip]) {
-            nwg::modal_error_message(&self.window, "Could not start ping", &e);
-        }
+        self.launch_terminal_tool(&format!("Ping {ip}"), "ping", &["-t", &ip], "Could not start ping");
     }
 
     fn on_traceroute(&self) {
         let Some((ip, _)) = self.selected_row_ip_mac() else { return };
-        if let Err(e) = tools::launch_visible("tracert", &[&ip]) {
-            nwg::modal_error_message(&self.window, "Could not start traceroute", &e);
-        }
+        self.launch_terminal_tool(&format!("Traceroute {ip}"), "tracert", &[&ip], "Could not start traceroute");
     }
 
     fn on_ssh(&self) {
         let Some((ip, _)) = self.selected_row_ip_mac() else { return };
-        if let Err(e) = tools::launch_visible("ssh", &[&ip]) {
-            nwg::modal_error_message(
-                &self.window,
-                "Could not start SSH",
-                &format!("{e}\n\nWindows' OpenSSH client (ssh.exe) may not be installed — it's an optional Windows feature."),
-            );
+        self.launch_terminal_tool(&format!("SSH {ip}"), "ssh", &[&ip], "Could not start SSH");
+    }
+
+    /// Opens `program args...` in a new in-window ConPTY tab. Falls back to
+    /// the old external-console `tools::launch_visible` (with a status
+    /// message explaining why) if ConPTY itself is unavailable — e.g.
+    /// Windows older than the 1809 update — rather than hard-failing.
+    fn launch_terminal_tool(&self, title: &str, program: &str, args: &[&str], fail_title: &str) {
+        match self.spawn_terminal_tab(title, program, args) {
+            Ok(()) => {
+                self.set_status(&format!("{title}: session started."));
+            }
+            Err(e) => {
+                self.set_status(&format!("In-window terminal unavailable ({e}); opening external console instead."));
+                if let Err(e) = tools::launch_visible(program, args) {
+                    let hint = if program == "ssh" {
+                        "\n\nWindows' OpenSSH client (ssh.exe) may not be installed — it's an optional Windows feature."
+                    } else {
+                        ""
+                    };
+                    nwg::modal_error_message(&self.window, fail_title, &format!("{e}{hint}"));
+                }
+            }
+        }
+    }
+
+    /// Spawns `program args...` under a real ConPTY, in a new tab of
+    /// `terminal_tabs`. Keystrokes typed into the tab's (read-only) output
+    /// box are forwarded raw to the pty; the pty's own output is decoded
+    /// from the ANSI byte stream and rendered back on the timer tick (see
+    /// `drain_pty_sessions`) rather than synchronously here, matching the
+    /// scan/autodetect/identify background-thread pattern already used
+    /// elsewhere in this file.
+    fn spawn_terminal_tab(&self, title: &str, program: &str, args: &[&str]) -> Result<(), String> {
+        let session = PtySession::spawn(program, args, TERMINAL_COLS, TERMINAL_ROWS)?;
+        let session = Rc::new(session);
+
+        let mut tab = nwg::Tab::default();
+        nwg::Tab::builder().parent(&self.terminal_tabs).text(title).build(&mut tab).map_err(|e| e.to_string())?;
+
+        let mut output = nwg::RichTextBox::default();
+        nwg::RichTextBox::builder()
+            .parent(&tab)
+            .readonly(true)
+            .font(Some(&self.terminal_font))
+            .flags(nwg::RichTextBoxFlags::VISIBLE | nwg::RichTextBoxFlags::VSCROLL | nwg::RichTextBoxFlags::AUTOVSCROLL)
+            .build(&mut output)
+            .map_err(|e| e.to_string())?;
+
+        let layout = nwg::GridLayout::default();
+        nwg::GridLayout::builder().parent(&tab).spacing(0).child(0, 0, &output).build(&layout).map_err(|e| e.to_string())?;
+
+        // Read-only prevents the control's default WM_CHAR handling from
+        // locally inserting typed characters (which would double up with
+        // the remote echo); we still receive OnChar/OnKeyPress on it and
+        // forward those bytes to the pty ourselves — see `key_event_bytes`.
+        let forward_session = Rc::clone(&session);
+        let key_handler = nwg::bind_event_handler(&output.handle, &tab.handle, move |evt, evt_data, _handle| {
+            let bytes = match evt {
+                nwg::Event::OnChar => key_event_bytes_from_char(evt_data.on_char()),
+                nwg::Event::OnKeyPress => key_event_bytes_from_vk(evt_data.on_key()),
+                _ => None,
+            };
+            if let Some(bytes) = bytes {
+                forward_session.write_input(&bytes);
+            }
+        });
+
+        let index = self.terminal_tabs.tab_count().saturating_sub(1);
+        self.terminal_tabs.set_selected_tab(index);
+        output.set_focus();
+
+        self.pty_sessions.borrow_mut().push(PtyTabSession {
+            title: title.to_string(),
+            tab,
+            output,
+            _layout: layout,
+            session,
+            screen: ScreenBuffer::new(TERMINAL_COLS, TERMINAL_ROWS),
+            ended: Cell::new(false),
+            _key_handler: key_handler,
+        });
+
+        Ok(())
+    }
+
+    fn drain_pty_sessions(&self) {
+        let mut sessions = self.pty_sessions.borrow_mut();
+        for s in sessions.iter_mut() {
+            if s.ended.get() {
+                continue;
+            }
+
+            let chunks: Vec<Vec<u8>> = s.session.output_rx.try_iter().collect();
+            for chunk in chunks {
+                s.screen.feed(&chunk);
+            }
+            if s.screen.take_dirty() {
+                redraw_pty_output(&s.output, &s.screen);
+            }
+
+            if s.session.has_exited() {
+                s.ended.set(true);
+                s.tab.set_text(&format!("{} (ended)", s.title));
+            }
+        }
+    }
+
+    /// Kills every still-running Ping/Traceroute/SSH session. Called on
+    /// window close so no `ping`/`tracert`/`ssh` child process is left
+    /// running after the app exits — same unconditional-cleanup philosophy
+    /// as `revert_all_backups_silently`. Individual tabs can't be removed
+    /// from `terminal_tabs` at runtime (native-windows-gui 1.0.13's
+    /// `TabsContainer`/`Tab` has no item-removal API — only `Drop`, which
+    /// destroys the tab's window but not its entry in the tab strip), so a
+    /// session instead just marks itself "(ended)" when its process exits;
+    /// this only forcibly stops sessions still running.
+    fn kill_all_pty_sessions(&self) {
+        for s in self.pty_sessions.borrow().iter() {
+            if !s.ended.get() {
+                s.session.kill();
+            }
         }
     }
 
@@ -823,8 +985,109 @@ impl App {
     /// prompt — the user should never have to remember to clean up network
     /// settings themselves. A dialog only appears if a revert genuinely fails.
     fn on_close(&self) {
+        self.kill_all_pty_sessions();
         self.revert_all_backups_silently("");
         nwg::stop_thread_dispatch();
+    }
+}
+
+/// Translates an `OnChar` event into the raw byte(s) to send to a pty.
+/// `nwg` already gives us the platform's translated character (including
+/// Ctrl-combinations, which Windows reports as the corresponding C0 control
+/// character, e.g. Ctrl+C -> 0x03) — no separate modifier-state check needed
+/// for those.
+fn key_event_bytes_from_char(c: char) -> Option<Vec<u8>> {
+    // Enter arrives here as '\r'; pty programs (and remote shells) expect
+    // that as-is, so pass it straight through rather than translating.
+    let mut buf = [0u8; 4];
+    Some(c.encode_utf8(&mut buf).as_bytes().to_vec())
+}
+
+/// Translates a non-printable `OnKeyPress` virtual-key code (arrows, Home,
+/// End, ...) into the ANSI escape sequence a terminal program expects.
+/// Printable keys and Enter/Backspace/Tab are handled via `OnChar` instead
+/// (this event fires for both, so only the non-printable ones are mapped
+/// here to avoid double-sending).
+fn key_event_bytes_from_vk(vk: u32) -> Option<Vec<u8>> {
+    use nwg::keys;
+    let seq: &[u8] = match vk {
+        keys::UP => b"\x1b[A",
+        keys::DOWN => b"\x1b[B",
+        keys::RIGHT => b"\x1b[C",
+        keys::LEFT => b"\x1b[D",
+        keys::HOME => b"\x1b[H",
+        keys::END => b"\x1b[F",
+        keys::DELETE => b"\x1b[3~",
+        keys::PRIOR => b"\x1b[5~", // Page Up
+        keys::NEXT => b"\x1b[6~",  // Page Down
+        _ => return None,
+    };
+    Some(seq.to_vec())
+}
+
+/// Redraws a pty tab's whole screen buffer into its RichTextBox: clears the
+/// control, writes the plain text back, then applies `CharFormat` color runs
+/// on top (the RichEdit "select range, then format the selection" pattern
+/// used by nwg's rich-text example). Full-buffer redraw on every dirty tick
+/// is simple and fast enough at 80x24; only runs when `take_dirty()` is
+/// true, so an idle session costs nothing between ticks.
+///
+/// `ScreenBuffer` is a fixed 80x24 grid, so `rows_as_runs()` always returns
+/// 24 rows — most of them blank padding until the session has produced that
+/// much output. Rendering all 24 (and then `scroll_lastline()`-ing to the
+/// very end) made the view jump past the real last line into that blank
+/// space below it. Trimming trailing blank rows/whitespace before rendering
+/// keeps the last *actual* line of output at the bottom, and means there's
+/// nothing to scroll to until the content genuinely overflows the visible
+/// area — ordinary terminal behavior.
+fn redraw_pty_output(output: &nwg::RichTextBox, screen: &ScreenBuffer) {
+    let mut rows = screen.rows_as_runs();
+    for row in rows.iter_mut() {
+        trim_trailing_whitespace(row);
+    }
+    let last_content_row = rows.iter().rposition(|runs| !runs.is_empty()).unwrap_or(0);
+    let rows = &rows[..=last_content_row];
+
+    let text = rows.iter().map(|runs| runs.iter().map(|(s, _, _)| s.as_str()).collect::<String>()).collect::<Vec<_>>().join("\r\n");
+    output.set_text(&text);
+
+    let mut offset: u32 = 0;
+    for (row_idx, runs) in rows.iter().enumerate() {
+        for (run_text, color, bold) in runs {
+            let len = run_text.chars().count() as u32;
+            if (*color != Color::Default || *bold) && len > 0 {
+                output.set_selection(offset..offset + len);
+                output.set_char_format(&nwg::CharFormat {
+                    text_color: color.rgb().map(|(r, g, b)| [r, g, b]),
+                    effects: if *bold { Some(nwg::CharEffects::BOLD) } else { None },
+                    ..Default::default()
+                });
+            }
+            offset += len;
+        }
+        if row_idx + 1 < rows.len() {
+            offset += 2; // "\r\n" separator
+        }
+    }
+    output.set_selection(offset..offset);
+    output.scroll_lastline();
+}
+
+/// Strips trailing space padding from a row's styled runs (dropping runs
+/// that become empty), so a row shorter than the buffer's full column width
+/// doesn't render as text padded out with invisible trailing spaces.
+fn trim_trailing_whitespace(runs: &mut Vec<(String, Color, bool)>) {
+    while let Some(last) = runs.last_mut() {
+        let trimmed_len = last.0.trim_end().len();
+        if trimmed_len == last.0.len() {
+            break;
+        }
+        last.0.truncate(trimmed_len);
+        if last.0.is_empty() {
+            runs.pop();
+        } else {
+            break;
+        }
     }
 }
 
