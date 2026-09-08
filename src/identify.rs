@@ -34,6 +34,7 @@ pub const PORTS_TO_CHECK: &[(u16, &str)] = &[
 
 const PORT_TIMEOUT: Duration = Duration::from_millis(350);
 const DNS_TIMEOUT: Duration = Duration::from_millis(800);
+const NETBIOS_TIMEOUT: Duration = Duration::from_millis(1500);
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct IdentifyResult {
@@ -54,7 +55,7 @@ pub fn identify(ip: &str, mac: Option<[u8; 6]>) -> IdentifyResult {
 
     // No PTR records for link-local addresses, and NetBIOS is IPv4-only —
     // neither applies to an IPv6 target, so don't waste the round trips.
-    let hostname = if is_ipv6(ip) { None } else { reverse_dns_with_timeout(ip).or_else(|| netbios_name(ip)) };
+    let hostname = if is_ipv6(ip) { None } else { reverse_dns_with_timeout(ip).or_else(|| netbios_name_with_timeout(ip)) };
 
     let open_ports = port_scan(ip, PORTS_TO_CHECK);
 
@@ -80,6 +81,21 @@ fn reverse_dns_with_timeout(ip: &str) -> Option<String> {
 pub fn netbios_name(ip: &str) -> Option<String> {
     let output = winproc::command("nbtstat").args(["-A", ip]).output().ok()?;
     parse_netbios_name(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// `nbtstat -A` has no built-in timeout of its own, unlike
+/// `reverse_dns_with_timeout`'s explicit one — against a host that silently
+/// drops NetBIOS traffic (common with firewalls, or simply a non-Windows
+/// device) it can block far longer than the DNS lookup ever would. Same
+/// "run on a helper thread, give up after a bound" pattern as
+/// `reverse_dns_with_timeout`.
+fn netbios_name_with_timeout(ip: &str) -> Option<String> {
+    let ip = ip.to_string();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(netbios_name(&ip));
+    });
+    rx.recv_timeout(NETBIOS_TIMEOUT).ok().flatten()
 }
 
 /// Parses `nbtstat -A <ip>` output. Prefers the `<20>` (workstation service)

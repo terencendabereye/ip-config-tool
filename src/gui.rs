@@ -72,9 +72,17 @@ pub struct App {
     // Persisted via `subnets::save` — loaded once at startup.
     custom_subnets: RefCell<Vec<CustomSubnet>>,
 
+    // A single persistent channel shared by every identify request, rather
+    // than one created per click: selecting a device while an earlier one is
+    // still resolving (e.g. clicking a device's IPv4 row, then its IPv6 row
+    // before the first finishes) used to replace this channel outright,
+    // silently dropping the in-flight request's result — its row would then
+    // show "Resolving…" forever. `identify_inflight` is a set (not a single
+    // slot) for the same reason: more than one IP can legitimately be
+    // resolving at once.
+    identify_tx: RefCell<Option<std::sync::mpsc::Sender<(String, IdentifyResult)>>>,
     identify_rx: RefCell<Option<Receiver<(String, IdentifyResult)>>>,
-    identify_running: Arc<AtomicBool>,
-    identify_inflight: RefCell<Option<String>>,
+    identify_inflight: RefCell<HashSet<String>>,
     identify_cache: RefCell<HashMap<String, IdentifyResult>>,
 
     // Live Ping/Traceroute/SSH sessions, one per launched tab. Tabs and
@@ -737,10 +745,13 @@ impl App {
                 continue;
             }
             drop(seen);
-            self.results_list.insert_items_row(
-                None,
-                &[n.address_with_zone.as_str(), n.mac.as_deref().unwrap_or(""), "", "", ""],
-            );
+            // `netsh interface ipv6 show neighbors` reports MACs lowercase;
+            // the ARP-based IPv4 scan (`scanner::format_mac`) uppercases
+            // them. Normalize to uppercase here so the same physical NIC
+            // shows an identical MAC whether it was found via IPv4 or IPv6 —
+            // otherwise the same device's two rows look like they disagree.
+            let mac = n.mac.as_deref().unwrap_or("").to_uppercase();
+            self.results_list.insert_items_row(None, &[n.address_with_zone.as_str(), mac.as_str(), "", "", ""]);
         }
 
         if !self.ipv6_running.load(Ordering::SeqCst) && self.ipv6_rx.borrow().is_some() {
@@ -807,7 +818,7 @@ impl App {
             return;
         }
 
-        if self.identify_inflight.borrow().as_deref() == Some(ip.as_str()) {
+        if self.identify_inflight.borrow().contains(&ip) {
             return; // already resolving this one
         }
 
@@ -823,17 +834,26 @@ impl App {
             ..Default::default()
         });
 
-        *self.identify_inflight.borrow_mut() = Some(ip.clone());
-        let (tx, rx) = std::sync::mpsc::channel();
-        *self.identify_rx.borrow_mut() = Some(rx);
-        self.identify_running.store(true, Ordering::SeqCst);
+        self.identify_inflight.borrow_mut().insert(ip.clone());
 
-        let running = Arc::clone(&self.identify_running);
+        // Create the shared channel on the first identify ever, then reuse
+        // it (cloning the sender) for every later request — see the
+        // `identify_tx`/`identify_rx` field comment for why this can't be
+        // recreated per click the way `scan_rx`/`autodetect_rx` are.
+        let tx = {
+            let mut tx_slot = self.identify_tx.borrow_mut();
+            if tx_slot.is_none() {
+                let (tx, rx) = std::sync::mpsc::channel();
+                *self.identify_rx.borrow_mut() = Some(rx);
+                *tx_slot = Some(tx);
+            }
+            tx_slot.as_ref().unwrap().clone()
+        };
+
         let ip_owned = ip.clone();
         thread::spawn(move || {
             let result = identify::identify(&ip_owned, mac);
             let _ = tx.send((ip_owned, result));
-            running.store(false, Ordering::SeqCst);
         });
     }
 
@@ -844,16 +864,10 @@ impl App {
         }
         for (ip, result) in results {
             self.identify_cache.borrow_mut().insert(ip.clone(), result.clone());
-            if self.identify_inflight.borrow().as_deref() == Some(ip.as_str()) {
-                *self.identify_inflight.borrow_mut() = None;
-            }
+            self.identify_inflight.borrow_mut().remove(&ip);
             if let Some(row) = self.find_row_by_ip(&ip) {
                 self.write_identify_result(row, &result);
             }
-        }
-
-        if !self.identify_running.load(Ordering::SeqCst) && self.identify_rx.borrow().is_some() {
-            *self.identify_rx.borrow_mut() = None;
         }
     }
 
