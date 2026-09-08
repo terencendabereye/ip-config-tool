@@ -1,8 +1,8 @@
 //! Launching standard OS network tools against a discovered device, and
-//! Wake-on-LAN. Ping/Traceroute/SSH intentionally open a normal *visible*
-//! console window (unlike the hidden `netsh`/`arp` calls in `winproc`) since
-//! they're meant to be watched/interacted with — see the plan for why an
-//! in-app terminal (ConPTY) was deliberately deferred to a follow-up issue.
+//! Wake-on-LAN. `launch_visible` opens a normal *visible* external console
+//! window; it's now only a fallback for when `pty::PtySession::spawn`
+//! (the primary path, wired up in `gui::App::launch_terminal_tool`) can't
+//! create a ConPTY, e.g. on Windows older than the 1809 update.
 
 use crate::winproc;
 use std::net::UdpSocket;
