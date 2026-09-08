@@ -5,8 +5,13 @@ unknown IP address (PLCs, RTUs, energy meters, etc.):
 
 1. Pick the network adapter that's wired to the device.
 2. Either type in the IP/subnet/gateway you want to use, or click
-   **Auto-detect subnet** to have it probe common industrial subnets
-   (192.168.1.0/24, 192.168.0.0/24, 10.0.0.0/24, ...) for a live device.
+   **Auto-detect subnet** to have it probe a wide range of common private
+   subnets for a live device. If you already know the device's subnet (read
+   off its own HMI/settings screen, say) but it's not one of the common
+   ones — plenty of industrial gear ships on arbitrary ranges no fixed list
+   could fully cover — type it in and click **Save subnet**: it's
+   remembered on disk and tried first on every future auto-detect. Click
+   **Save subnet** again with the same values to remove it.
 3. **Scan for devices** to ARP-sweep the current /24 and see what's alive
    (the same mechanism Windows itself uses for `arp -a` — faster and more
    reliable than pinging, since it works even when a device's firewall

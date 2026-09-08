@@ -9,6 +9,7 @@ use crate::netconfig;
 use crate::netiface::{self, InterfaceConfig};
 use crate::pty::PtySession;
 use crate::scanner::{self, ScanResult};
+use crate::subnets::{self, CustomSubnet};
 use crate::tools;
 use crate::validate;
 
@@ -65,6 +66,11 @@ pub struct App {
     autodetect_rx: RefCell<Option<Receiver<AutoDetectEvent>>>,
     autodetect_cancel: RefCell<Option<Arc<Mutex<bool>>>>,
     autodetect_running: Arc<AtomicBool>,
+
+    // User-saved subnets (e.g. read off a device's own HMI), tried first
+    // during auto-detect, ahead of `autodetect::BUILTIN_CANDIDATES`.
+    // Persisted via `subnets::save` — loaded once at startup.
+    custom_subnets: RefCell<Vec<CustomSubnet>>,
 
     identify_rx: RefCell<Option<Receiver<(String, IdentifyResult)>>>,
     identify_running: Arc<AtomicBool>,
@@ -153,9 +159,14 @@ pub struct App {
     autodetect_button: nwg::Button,
 
     #[nwg_control(text: "Apply")]
-    #[nwg_layout_item(layout: grid, row: 3, col: 3, col_span: 2)]
+    #[nwg_layout_item(layout: grid, row: 3, col: 3)]
     #[nwg_events( OnButtonClick: [App::on_apply] )]
     apply_button: nwg::Button,
+
+    #[nwg_control(text: "Save subnet")]
+    #[nwg_layout_item(layout: grid, row: 3, col: 4)]
+    #[nwg_events( OnButtonClick: [App::on_save_subnet] )]
+    save_subnet_button: nwg::Button,
 
     #[nwg_control(text: "Scan for devices")]
     #[nwg_layout_item(layout: grid, row: 4, col: 0, col_span: 2)]
@@ -286,6 +297,8 @@ impl App {
         self.keep_button.set_enabled(false);
         self.set_device_actions_enabled(false);
 
+        *self.custom_subnets.borrow_mut() = subnets::load();
+
         self.refresh_interfaces();
         self.revert_all_backups_silently("Reverted leftover settings from a previous session");
 
@@ -371,8 +384,37 @@ impl App {
     /// never leave a stale value from a previously-selected adapter sitting
     /// in a field (that previously caused the IP field to get stuck on the
     /// first-listed adapter's address after switching to a different one).
+    ///
+    /// Retries briefly if the adapter reports no IP at all: right after
+    /// `netsh interface ip set address` returns, Windows can take a moment
+    /// to actually settle the new address (the adapter can briefly reset/
+    /// renegotiate) before `netsh interface ip show config` reflects it —
+    /// without this, an immediate re-read right after a successful Apply
+    /// could read that transient gap and wrongly appear to "clear" the IP
+    /// box, even though the address was actually applied correctly.
+    ///
+    /// Retries purely on `cfg.ip.is_none()` — NOT also gated on the `dhcp`
+    /// flag having already flipped, since that flag can be just as stale as
+    /// the IP itself in the same window (a first attempt that still reports
+    /// the old `dhcp: true` would otherwise skip retrying altogether and
+    /// clear the box on that one stale read — this was the bug in the first
+    /// version of this fix).
     fn refresh_current_config_display(&self, name: &str) {
-        match netiface::get_interface_config(name) {
+        const MAX_ATTEMPTS: u32 = 6;
+        const RETRY_DELAY: Duration = Duration::from_millis(400);
+
+        let mut last = netiface::get_interface_config(name);
+        for _ in 1..MAX_ATTEMPTS {
+            match &last {
+                Ok(cfg) if cfg.ip.is_none() => {
+                    thread::sleep(RETRY_DELAY);
+                    last = netiface::get_interface_config(name);
+                }
+                _ => break,
+            }
+        }
+
+        match last {
             Ok(cfg) => {
                 self.current_cfg_label.set_text(&summarize(&cfg));
                 self.ip_input.set_text(cfg.ip.as_deref().unwrap_or(""));
@@ -428,6 +470,49 @@ impl App {
         }
     }
 
+    /// Saves (or, if it's already saved, offers to remove) the subnet
+    /// currently in the IP/mask fields — e.g. one read straight off a
+    /// device's own HMI/settings screen — so future auto-detects try it
+    /// first, ahead of the built-in common-range list. Persisted to disk,
+    /// so it's remembered on the next visit to the same site, not just this
+    /// session.
+    fn on_save_subnet(&self) {
+        let ip = self.ip_input.text();
+        let mask = self.mask_input.text();
+
+        let Some(base) = base_of(&ip) else {
+            nwg::modal_error_message(&self.window, "No subnet to save", "Enter a valid IP address first.");
+            return;
+        };
+        if let Err(e) = validate::parse_mask(&mask) {
+            nwg::modal_error_message(&self.window, "Invalid subnet mask", &e);
+            return;
+        }
+
+        let mut list = self.custom_subnets.borrow_mut();
+
+        if subnets::remove(&mut list, &base, &mask) {
+            if let Err(e) = subnets::save(&list) {
+                nwg::modal_error_message(&self.window, "Could not update saved subnets", &e);
+                return;
+            }
+            self.set_status(&format!("Removed {base}.0/24 ({mask}) from saved subnets ({} remaining).", list.len()));
+            return;
+        }
+
+        list.push(CustomSubnet { base: base.clone(), mask: mask.clone(), label: None });
+        if let Err(e) = subnets::save(&list) {
+            list.pop();
+            nwg::modal_error_message(&self.window, "Could not save subnet", &e);
+            return;
+        }
+        self.set_status(&format!(
+            "Saved {base}.0/24 ({mask}) — tried first on every auto-detect from now on. \
+             Click Save subnet again with the same values to remove it. ({} saved total)",
+            list.len()
+        ));
+    }
+
     fn on_keep(&self) {
         self.revert_deadline.set(None);
         self.countdown_label.set_text("");
@@ -476,6 +561,16 @@ impl App {
             return;
         };
 
+        // Saved subnets first (most likely relevant — the user chose to
+        // remember them), then the built-in common-range list.
+        let candidates: Vec<(String, String)> = self
+            .custom_subnets
+            .borrow()
+            .iter()
+            .map(|c| (c.base.clone(), c.mask.clone()))
+            .chain(autodetect::BUILTIN_CANDIDATES.iter().map(|(b, m)| (b.to_string(), m.to_string())))
+            .collect();
+
         let cancelled = Arc::new(Mutex::new(false));
         *self.autodetect_cancel.borrow_mut() = Some(Arc::clone(&cancelled));
         let (tx, rx) = std::sync::mpsc::channel();
@@ -485,7 +580,7 @@ impl App {
         let running = Arc::clone(&self.autodetect_running);
         let iface_owned = iface.clone();
         thread::spawn(move || {
-            autodetect::run(&iface_owned, &original, tx, cancelled);
+            autodetect::run(&iface_owned, &original, &candidates, tx, cancelled);
             running.store(false, Ordering::SeqCst);
         });
 

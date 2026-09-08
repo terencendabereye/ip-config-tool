@@ -9,14 +9,30 @@ use crate::scanner::{self, ScanResult};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
-/// (network base e.g. "192.168.1", mask) in priority order.
-pub const CANDIDATES: &[(&str, &str)] = &[
+/// (network base e.g. "192.168.1", mask) in priority order. All private
+/// (RFC 1918) space, safe to probe. This is a starting point, not an
+/// exhaustive vendor-default list — plenty of industrial gear (NR Electric
+/// relays among them) ships on arbitrary non-private ranges no fixed list
+/// could cover completely, which is what `subnets::CustomSubnet` is for:
+/// save a subnet once (e.g. read off a device's own HMI) and it's tried
+/// automatically, ahead of this list, on every future auto-detect.
+pub const BUILTIN_CANDIDATES: &[(&str, &str)] = &[
     ("192.168.1", "255.255.255.0"),
     ("192.168.0", "255.255.255.0"),
     ("192.168.10", "255.255.255.0"),
+    ("192.168.2", "255.255.255.0"),
+    ("192.168.11", "255.255.255.0"),
+    ("192.168.20", "255.255.255.0"),
+    ("192.168.100", "255.255.255.0"),
+    ("192.168.123", "255.255.255.0"),
     ("10.0.0", "255.255.255.0"),
     ("10.0.1", "255.255.255.0"),
+    ("10.1.0", "255.255.255.0"),
+    ("10.1.1", "255.255.255.0"),
+    ("10.10.10", "255.255.255.0"),
     ("172.16.0", "255.255.255.0"),
+    ("172.16.1", "255.255.255.0"),
+    ("172.20.0", "255.255.255.0"),
 ];
 
 /// The probe address we temporarily assign ourselves while testing a candidate
@@ -67,13 +83,19 @@ where
 /// is found, in which case the interface is left on the matching subnet for
 /// the caller to confirm/apply for real. Always call with a fresh backup
 /// already saved via `netconfig::backup_current_config`.
+///
+/// `candidates` is the caller's combined list — typically the user's saved
+/// `subnets::CustomSubnet`s (tried first, most likely relevant) followed by
+/// `BUILTIN_CANDIDATES` — rather than a hardcoded global, since custom
+/// entries are loaded from disk and owned, not `'static`.
 pub fn run(
     iface: &str,
     original: &InterfaceConfig,
+    candidates: &[(String, String)],
     events: Sender<AutoDetectEvent>,
     cancelled: Arc<Mutex<bool>>,
 ) {
-    for (base, mask) in CANDIDATES {
+    for (base, mask) in candidates {
         if *cancelled.lock().unwrap() {
             let _ = events.send(AutoDetectEvent::Cancelled);
             restore_original(iface, original);
@@ -180,8 +202,16 @@ mod tests {
     }
 
     #[test]
-    fn candidates_list_is_in_expected_priority_order() {
-        assert_eq!(CANDIDATES[0], ("192.168.1", "255.255.255.0"));
-        assert_eq!(CANDIDATES[1], ("192.168.0", "255.255.255.0"));
+    fn builtin_candidates_list_is_in_expected_priority_order() {
+        assert_eq!(BUILTIN_CANDIDATES[0], ("192.168.1", "255.255.255.0"));
+        assert_eq!(BUILTIN_CANDIDATES[1], ("192.168.0", "255.255.255.0"));
+    }
+
+    #[test]
+    fn builtin_candidates_has_no_duplicate_base_mask_pairs() {
+        let mut seen = std::collections::HashSet::new();
+        for pair in BUILTIN_CANDIDATES {
+            assert!(seen.insert(pair), "duplicate candidate: {pair:?}");
+        }
     }
 }

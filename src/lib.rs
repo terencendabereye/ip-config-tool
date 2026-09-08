@@ -14,6 +14,7 @@ pub mod netiface;
 pub mod oui;
 mod pty;
 pub mod scanner;
+pub mod subnets;
 pub mod tools;
 pub mod validate;
 mod winproc;
