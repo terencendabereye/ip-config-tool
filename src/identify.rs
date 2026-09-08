@@ -5,9 +5,10 @@
 //! when the user selects a row in the scan results, never automatically for
 //! every host (that would slow the bulk ARP sweep down for no benefit).
 
+use crate::ipv6;
 use crate::oui;
 use crate::winproc;
-use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6, TcpStream};
 use std::str::FromStr;
 use std::sync::mpsc;
 use std::thread;
@@ -44,12 +45,24 @@ pub struct IdentifyResult {
 /// Runs the full identification for one device. Blocking (DNS + up to 11
 /// port probes with short timeouts) — always call from a background thread,
 /// never the GUI thread.
-pub fn identify(ip: &str, mac: [u8; 6]) -> IdentifyResult {
-    let vendor = oui::vendor_lookup_mac(mac).map(|v| v.to_string());
-    let hostname = reverse_dns_with_timeout(ip).or_else(|| netbios_name(ip));
+///
+/// `mac` is `None` for an IPv6 neighbor-table entry that never resolved a
+/// link-layer address (state "Incomplete" — see `ipv6::parse_neighbor_table`);
+/// vendor lookup is skipped in that case rather than guessing.
+pub fn identify(ip: &str, mac: Option<[u8; 6]>) -> IdentifyResult {
+    let vendor = mac.and_then(oui::vendor_lookup_mac).map(|v| v.to_string());
+
+    // No PTR records for link-local addresses, and NetBIOS is IPv4-only —
+    // neither applies to an IPv6 target, so don't waste the round trips.
+    let hostname = if is_ipv6(ip) { None } else { reverse_dns_with_timeout(ip).or_else(|| netbios_name(ip)) };
+
     let open_ports = port_scan(ip, PORTS_TO_CHECK);
 
     IdentifyResult { vendor, hostname, open_ports }
+}
+
+fn is_ipv6(ip: &str) -> bool {
+    ip.contains(':')
 }
 
 /// `dns_lookup::lookup_addr` has no built-in timeout and an unresponsive/
@@ -91,18 +104,38 @@ pub fn parse_netbios_name(text: &str) -> Option<String> {
     fallback
 }
 
+/// Base address to probe, resolved once up front rather than per-port.
+/// `Ipv6Addr::from_str`/`IpAddr::from_str` don't understand a `%zone`
+/// suffix at all, so a scoped link-local literal (e.g.
+/// "fe80::1%20") needs its zone split off and fed to `SocketAddrV6`
+/// directly instead of through string parsing.
+#[derive(Clone, Copy)]
+enum Target {
+    V4(IpAddr),
+    V6 { addr: Ipv6Addr, scope_id: u32 },
+}
+
+fn resolve_target(ip: &str) -> Option<Target> {
+    let (base, zone) = ipv6::split_zone(ip);
+    match zone {
+        Some(zone) => Some(Target::V6 { addr: Ipv6Addr::from_str(base).ok()?, scope_id: zone.parse().ok()? }),
+        None => Some(Target::V4(IpAddr::from_str(base).ok()?)),
+    }
+}
+
 /// Probes each port in `ports` in parallel with a short connect timeout,
 /// returning the labels of the ones that accepted a connection.
 pub fn port_scan(ip: &str, ports: &[(u16, &'static str)]) -> Vec<&'static str> {
-    let Ok(addr) = IpAddr::from_str(ip) else { return Vec::new() };
+    let Some(target) = resolve_target(ip) else { return Vec::new() };
 
     let handles: Vec<_> = ports
         .iter()
         .map(|&(port, label)| {
-            thread::spawn(move || {
-                let sock = SocketAddr::new(addr, port);
-                TcpStream::connect_timeout(&sock, PORT_TIMEOUT).is_ok().then_some(label)
-            })
+            let sock = match target {
+                Target::V4(addr) => SocketAddr::new(addr, port),
+                Target::V6 { addr, scope_id } => SocketAddr::V6(SocketAddrV6::new(addr, port, 0, scope_id)),
+            };
+            thread::spawn(move || TcpStream::connect_timeout(&sock, PORT_TIMEOUT).is_ok().then_some(label))
         })
         .collect();
 
@@ -177,5 +210,46 @@ Node IpAddress: [192.168.1.5] Scope Id: []\r\n\
     #[test]
     fn port_scan_handles_invalid_ip_gracefully() {
         assert!(port_scan("not-an-ip", PORTS_TO_CHECK).is_empty());
+    }
+
+    #[test]
+    fn port_scan_accepts_scoped_ipv6_link_local_address() {
+        // Reserved/unused-in-practice link-local address; nothing should be
+        // listening, but this exercises the %zone parsing path end to end
+        // without hanging or erroring out.
+        let result = port_scan("fe80::dead:beef%1", &[(1, "test")]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn resolve_target_splits_v6_zone_into_scope_id() {
+        let target = resolve_target("fe80::1%20").expect("should parse");
+        match target {
+            Target::V6 { addr, scope_id } => {
+                assert_eq!(addr, Ipv6Addr::from_str("fe80::1").unwrap());
+                assert_eq!(scope_id, 20);
+            }
+            Target::V4(_) => panic!("expected V6 target"),
+        }
+    }
+
+    #[test]
+    fn resolve_target_rejects_non_numeric_zone() {
+        assert!(resolve_target("fe80::1%not-a-number").is_none());
+    }
+
+    #[test]
+    fn resolve_target_handles_plain_ipv4() {
+        let target = resolve_target("192.168.1.1").expect("should parse");
+        match target {
+            Target::V4(addr) => assert_eq!(addr, IpAddr::from_str("192.168.1.1").unwrap()),
+            Target::V6 { .. } => panic!("expected V4 target"),
+        }
+    }
+
+    #[test]
+    fn is_ipv6_distinguishes_address_families() {
+        assert!(is_ipv6("fe80::1%20"));
+        assert!(!is_ipv6("192.168.1.1"));
     }
 }
