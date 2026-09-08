@@ -44,7 +44,14 @@ pub struct App {
     identify_inflight: RefCell<Option<String>>,
     identify_cache: RefCell<HashMap<String, IdentifyResult>>,
 
-    #[nwg_resource(source_bin: Some(include_bytes!("../assets/app.ico")))]
+    // Reads the icon back out of the exe's own compiled-in resources (put
+    // there by `winres` in build.rs, at id "1") rather than decoding raw
+    // bytes at runtime — the latter (`Icon::from_bin`) requires nwg's
+    // "image-decoder" feature and panics without it.
+    #[nwg_resource]
+    embedded_resources: nwg::EmbedResource,
+
+    #[nwg_resource(source_embed: Some(&data.embedded_resources), source_embed_id: 1)]
     app_icon: nwg::Icon,
 
     #[nwg_control(size: (1000, 780), position: (200, 100), title: "IP Config Tool", icon: Some(&data.app_icon), flags: "WINDOW|VISIBLE|RESIZABLE")]

@@ -23,7 +23,7 @@ winapi = { version = "0.3.9", features = ["iphlpapi", "minwindef"] }
 [dependencies.native-windows-gui]
 version = "1.0.13"
 default-features = false
-features = ["combobox", "list-view", "timer", "notice", "clipboard"]
+features = ["combobox", "list-view", "timer", "notice", "clipboard", "embed-resource"]
 
 [build-dependencies]
 embed-manifest = "1.5.0"
