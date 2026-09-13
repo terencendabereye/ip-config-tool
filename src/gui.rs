@@ -612,6 +612,8 @@ impl App {
         self.scan_seen.borrow_mut().clear();
         self.scan_completion_pending.set(true);
 
+        let is_link_local = scanner::is_link_local_base(&base);
+
         let cancelled = Arc::new(Mutex::new(false));
         *self.scan_cancel.borrow_mut() = Some(Arc::clone(&cancelled));
         let (tx, rx) = std::sync::mpsc::channel();
@@ -620,6 +622,15 @@ impl App {
 
         let running = Arc::clone(&self.scan_running);
         thread::spawn(move || {
+            // A link-local (169.254.0.0/16, APIPA) address means no DHCP server
+            // answered — e.g. a direct Ethernet cable with no router — and the
+            // peer's random host bits can land in any of the 256 /24s in that
+            // /16, not just ours. The targeted /24 sweep alone would almost
+            // certainly miss it, so also broadcast-ping and check the whole
+            // range via the ARP table.
+            if is_link_local {
+                scanner::sweep_link_local(tx.clone(), Arc::clone(&cancelled));
+            }
             scanner::sweep_subnet_v24(&base, tx, cancelled);
             running.store(false, Ordering::SeqCst);
         });
@@ -627,7 +638,11 @@ impl App {
         self.start_ipv6_discovery();
 
         self.scan_button.set_enabled(false);
-        self.set_status("Scanning (ARP + IPv6 neighbors)...");
+        self.set_status(if is_link_local {
+            "Scanning (broadcast + ARP across the full 169.254.0.0/16 link-local range + IPv6 neighbors)..."
+        } else {
+            "Scanning (ARP + IPv6 neighbors)..."
+        });
     }
 
     /// Looks up the selected interface's numeric index (needed to scope

@@ -145,6 +145,54 @@ pub fn sweep_subnet_v24(base: &str, sender: Sender<ScanResult>, cancelled: Arc<M
     }
 }
 
+/// Windows/RFC 3927 auto-assigns a 169.254.0.0/16 (APIPA/link-local) address
+/// when no DHCP server responds — exactly what happens on a bare direct
+/// Ethernet link between two PCs with no router or DHCP. Each side picks its
+/// host bits at random, so the peer can land in any of the 256 possible /24s
+/// in that /16, not just the one implied by our own address. Actively
+/// ARP-sweeping the full /16 (65,536 addresses) would take far too long for
+/// a "scan" button, so instead: send one broadcast ping to make whatever's
+/// listening on the segment reply (that reply alone causes Windows to
+/// populate its own ARP cache for the sender), then read the ARP table back
+/// for *any* 169.254.x.x entry — not just ones in our own /24, since the
+/// peer's slice is unknown up front. This is a best-effort supplement to
+/// `sweep_subnet_v24`, not a replacement: call both when the current base is
+/// link-local so a peer that happens to share our /24 is still found by the
+/// direct ARP sweep even if it doesn't answer ICMP.
+pub fn sweep_link_local(sender: Sender<ScanResult>, cancelled: Arc<Mutex<bool>>) {
+    if *cancelled.lock().unwrap() {
+        return;
+    }
+
+    let _ = broadcast_ping("169.254.255.255");
+
+    if *cancelled.lock().unwrap() {
+        return;
+    }
+
+    if let Ok(arp_text) = run_arp_a() {
+        for (ip, mac) in parse_arp_table(&arp_text) {
+            if ip.starts_with("169.254.") {
+                let _ = sender.send(ScanResult { ip, mac });
+            }
+        }
+    }
+}
+
+/// True if `base` (a ".".-joined first-three-octets string, e.g. "169.254.83")
+/// falls in the 169.254.0.0/16 link-local range.
+pub fn is_link_local_base(base: &str) -> bool {
+    base.starts_with("169.254.")
+}
+
+fn broadcast_ping(target: &str) -> Result<(), String> {
+    winproc::command("ping")
+        .args(["-n", "2", "-w", "500", target])
+        .output()
+        .map_err(|e| format!("failed to launch ping: {e}"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,6 +253,14 @@ Interface: 172.20.10.2 --- 0x14\r\n\
     #[test]
     fn format_mac_pads_and_uppercases() {
         assert_eq!(format_mac(&[0x02, 0xa, 0xff, 0x00, 0x1, 0xbc]), "02-0A-FF-00-01-BC");
+    }
+
+    #[test]
+    fn is_link_local_base_matches_apipa_range() {
+        assert!(is_link_local_base("169.254.83"));
+        assert!(is_link_local_base("169.254.0"));
+        assert!(!is_link_local_base("192.168.1"));
+        assert!(!is_link_local_base("169.253.0"));
     }
 
     #[test]
