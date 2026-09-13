@@ -614,6 +614,22 @@ impl App {
 
         let is_link_local = scanner::is_link_local_base(&base);
 
+        // Pin the ARP/ping requests to the selected adapter's own address
+        // rather than letting Windows' routing table pick an interface.
+        // When more than one adapter is link-local-addressed at once (e.g.
+        // Wi-Fi and Ethernet both self-assigned an APIPA address), every one
+        // of them gets an identical-metric on-link route to the *entire*
+        // 169.254.0.0/16 range, so a tied route can silently send requests
+        // out the wrong wire — the scan looks like it's running but can
+        // never reach a peer that's actually there. Fetched fresh from the
+        // selected interface rather than the IP box's text, since the user
+        // may have typed the *peer's* address in there as a scan target.
+        let src_ip = self
+            .current_iface()
+            .and_then(|name| netiface::get_interface_config(&name).ok())
+            .and_then(|cfg| cfg.ip)
+            .and_then(|ip| validate::parse_ipv4(&ip).ok());
+
         let cancelled = Arc::new(Mutex::new(false));
         *self.scan_cancel.borrow_mut() = Some(Arc::clone(&cancelled));
         let (tx, rx) = std::sync::mpsc::channel();
@@ -629,9 +645,9 @@ impl App {
             // certainly miss it, so also broadcast-ping and check the whole
             // range via the ARP table.
             if is_link_local {
-                scanner::sweep_link_local(tx.clone(), Arc::clone(&cancelled));
+                scanner::sweep_link_local(tx.clone(), Arc::clone(&cancelled), src_ip);
             }
-            scanner::sweep_subnet_v24(&base, tx, cancelled);
+            scanner::sweep_subnet_v24(&base, tx, cancelled, src_ip);
             running.store(false, Ordering::SeqCst);
         });
 

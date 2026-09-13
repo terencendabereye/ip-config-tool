@@ -111,8 +111,13 @@ pub fn run(
             return;
         }
 
+        // `probe_ip` is the address we just assigned `iface` above, so it's
+        // exactly the right source to pin the ARP requests to — see
+        // `scanner::arp_resolve` for why an unpinned source can silently
+        // scan out the wrong adapter when more than one is up at once.
+        let src_ip = crate::validate::parse_ipv4(&probe_ip).ok();
         let (tx, rx) = std::sync::mpsc::channel();
-        scanner::sweep_subnet_v24(base, tx, Arc::clone(&cancelled));
+        scanner::sweep_subnet_v24(base, tx, Arc::clone(&cancelled), src_ip);
         let results: Vec<ScanResult> = rx.try_iter().collect();
 
         let _ = events.send(AutoDetectEvent::CandidateResult { base: base.to_string(), host_count: results.len() });

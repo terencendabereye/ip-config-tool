@@ -28,15 +28,26 @@ pub struct ScanResult {
 /// the host doesn't respond (unreachable, wrong subnet, powered off, etc).
 /// `SendARP` triggers a real ARP request on the wire when the address isn't
 /// already cached, so this both discovers and resolves in one call.
-pub fn arp_resolve(octets: [u8; 4]) -> Option<String> {
+///
+/// `src_ip`, when given, pins which local interface the request goes out of.
+/// Leaving it `None` (`SrcIP = 0`) lets Windows' routing table pick, which is
+/// fine when there's only one plausible route — but every 169.254.0.0/16
+/// (APIPA) interface gets an identical-metric on-link route to the *entire*
+/// range, so with two or more link-local-addressed adapters up at once
+/// (e.g. Wi-Fi and Ethernet both self-assigned), a tied route can send the
+/// ARP request out the wrong wire and it'll never reach a peer that's very
+/// much there. Pass the selected adapter's own address to force it out the
+/// right one.
+pub fn arp_resolve(octets: [u8; 4], src_ip: Option<[u8; 4]>) -> Option<String> {
     // `SendARP` wants the address in "network order", i.e. the raw octets
     // read directly into a native-endian word — not the big-endian numeric
     // interpretation of the dotted quad.
     let dest_ip: ULONG = u32::from_ne_bytes(octets);
+    let src_ip: ULONG = src_ip.map(u32::from_ne_bytes).unwrap_or(0);
     let mut mac_addr = [0u8; 6];
     let mut addr_len: ULONG = mac_addr.len() as ULONG;
 
-    let result: DWORD = unsafe { SendARP(dest_ip, 0, mac_addr.as_mut_ptr() as *mut _, &mut addr_len) };
+    let result: DWORD = unsafe { SendARP(dest_ip, src_ip, mac_addr.as_mut_ptr() as *mut _, &mut addr_len) };
 
     const NO_ERROR: DWORD = 0;
     if result == NO_ERROR && addr_len == mac_addr.len() as ULONG {
@@ -105,7 +116,10 @@ fn parse_base(base: &str) -> Option<[u8; 3]> {
 /// Runs on the calling thread's pool of worker threads and blocks until the
 /// whole sweep is done, so call it from a background thread, never the GUI
 /// thread.
-pub fn sweep_subnet_v24(base: &str, sender: Sender<ScanResult>, cancelled: Arc<Mutex<bool>>) {
+///
+/// `src_ip` should be the selected adapter's own address — see `arp_resolve`
+/// for why leaving it `None` can silently scan out the wrong interface.
+pub fn sweep_subnet_v24(base: &str, sender: Sender<ScanResult>, cancelled: Arc<Mutex<bool>>, src_ip: Option<[u8; 4]>) {
     const WORKERS: usize = 48;
 
     let Some([a, b, c]) = parse_base(base) else { return };
@@ -122,7 +136,7 @@ pub fn sweep_subnet_v24(base: &str, sender: Sender<ScanResult>, cancelled: Arc<M
             .map(|octets| {
                 let sender = Arc::clone(&sender);
                 thread::spawn(move || {
-                    if let Some(mac) = arp_resolve(octets) {
+                    if let Some(mac) = arp_resolve(octets, src_ip) {
                         let ip = format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3]);
                         let _ = sender.lock().unwrap().send(ScanResult { ip, mac });
                     }
@@ -159,12 +173,19 @@ pub fn sweep_subnet_v24(base: &str, sender: Sender<ScanResult>, cancelled: Arc<M
 /// `sweep_subnet_v24`, not a replacement: call both when the current base is
 /// link-local so a peer that happens to share our /24 is still found by the
 /// direct ARP sweep even if it doesn't answer ICMP.
-pub fn sweep_link_local(sender: Sender<ScanResult>, cancelled: Arc<Mutex<bool>>) {
+///
+/// `src_ip`, when given, is passed as `ping`'s `-S` (source address) so the
+/// broadcast goes out the selected adapter specifically — see `arp_resolve`
+/// for why that matters when more than one adapter has a 169.254.0.0/16
+/// address at once (each gets an identical-metric on-link route to the
+/// whole range, so without pinning a source, Windows can send it out the
+/// wrong wire and it'll never reach a peer that's actually there).
+pub fn sweep_link_local(sender: Sender<ScanResult>, cancelled: Arc<Mutex<bool>>, src_ip: Option<[u8; 4]>) {
     if *cancelled.lock().unwrap() {
         return;
     }
 
-    let _ = broadcast_ping("169.254.255.255");
+    let _ = broadcast_ping("169.254.255.255", src_ip);
 
     if *cancelled.lock().unwrap() {
         return;
@@ -185,11 +206,14 @@ pub fn is_link_local_base(base: &str) -> bool {
     base.starts_with("169.254.")
 }
 
-fn broadcast_ping(target: &str) -> Result<(), String> {
-    winproc::command("ping")
-        .args(["-n", "2", "-w", "500", target])
-        .output()
-        .map_err(|e| format!("failed to launch ping: {e}"))?;
+fn broadcast_ping(target: &str, src_ip: Option<[u8; 4]>) -> Result<(), String> {
+    let mut cmd = winproc::command("ping");
+    cmd.args(["-n", "2", "-w", "500"]);
+    if let Some([a, b, c, d]) = src_ip {
+        cmd.args(["-S", &format!("{a}.{b}.{c}.{d}")]);
+    }
+    cmd.arg(target);
+    cmd.output().map_err(|e| format!("failed to launch ping: {e}"))?;
     Ok(())
 }
 
@@ -263,7 +287,7 @@ Interface: 172.20.10.2 --- 0x14\r\n\
         // what's plugged in, just that the broadcast-ping-then-read-ARP-table
         // flow runs to completion without panicking or hanging.
         let (tx, rx) = std::sync::mpsc::channel();
-        sweep_link_local(tx, Arc::new(Mutex::new(false)));
+        sweep_link_local(tx, Arc::new(Mutex::new(false)), None);
         let results: Vec<ScanResult> = rx.try_iter().collect();
         for r in &results {
             assert!(r.ip.starts_with("169.254."), "unexpected non-link-local result: {r:?}");
@@ -283,6 +307,6 @@ Interface: 172.20.10.2 --- 0x14\r\n\
         // 240.0.0.1 is in reserved/unused space and should never resolve on
         // any real network — this exercises the real SendARP call and
         // confirms it fails closed (None) rather than panicking or hanging.
-        assert_eq!(arp_resolve([240, 0, 0, 1]), None);
+        assert_eq!(arp_resolve([240, 0, 0, 1], None), None);
     }
 }
