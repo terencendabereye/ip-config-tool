@@ -256,6 +256,21 @@ Interface: 172.20.10.2 --- 0x14\r\n\
     }
 
     #[test]
+    fn sweep_link_local_completes_without_panicking() {
+        // Exercises the real ping + arp -a spawns against this machine's actual
+        // network state (like `arp_resolve_returns_none_for_unreachable_address`
+        // below does) — no assertion on *what* it finds since that depends on
+        // what's plugged in, just that the broadcast-ping-then-read-ARP-table
+        // flow runs to completion without panicking or hanging.
+        let (tx, rx) = std::sync::mpsc::channel();
+        sweep_link_local(tx, Arc::new(Mutex::new(false)));
+        let results: Vec<ScanResult> = rx.try_iter().collect();
+        for r in &results {
+            assert!(r.ip.starts_with("169.254."), "unexpected non-link-local result: {r:?}");
+        }
+    }
+
+    #[test]
     fn is_link_local_base_matches_apipa_range() {
         assert!(is_link_local_base("169.254.83"));
         assert!(is_link_local_base("169.254.0"));
